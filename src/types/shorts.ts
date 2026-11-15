@@ -74,6 +74,7 @@ export interface ShortVideoItem {
   duration: number;
   videoUrl?: string;
   posterUrl?: string;
+  nativeMediaId?: string;
   sourceFile?: File;
   sourceBlob?: Blob;
   sampleTheme?: 'aurora' | 'sunset' | 'kinetic';

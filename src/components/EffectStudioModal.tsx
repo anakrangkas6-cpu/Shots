@@ -17,7 +17,9 @@ import {
 import {
   cacheBlobToNativeServer,
   isNativeAndroid,
+  NativePickedVideo,
   openNativeAndroidPlayer,
+  pickNativeVideos,
 } from '../services/nativeMedia';
 import {
   ShortVideoItem,
@@ -45,7 +47,8 @@ interface EffectStudioModalProps {
   editingVideo: ShortVideoItem | null;
   onClose: () => void;
   onCreateVideo: (payload: {
-    file: File;
+    file?: File;
+    nativeVideo?: NativePickedVideo;
     title: string;
     description: string;
     effect: VideoEffectConfig;
@@ -78,6 +81,8 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
 
   const [activeTab, setActiveTab] = useState<StudioTab>('color');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedNativeVideo, setSelectedNativeVideo] =
+    useState<NativePickedVideo | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string>('');
   const [detectedDuration, setDetectedDuration] = useState<number>(0);
   const [title, setTitle] = useState('');
@@ -97,6 +102,7 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
 
     if (mode === 'edit' && editingVideo) {
       setSelectedFile(null);
+      setSelectedNativeVideo(null);
       setPreviewUrl(editingVideo.videoUrl || '');
       setDetectedDuration(editingVideo.duration || 15);
       setTitle(editingVideo.title);
@@ -104,6 +110,7 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
       setEffect({ ...DEFAULT_EFFECT_CONFIG, ...editingVideo.effect });
     } else {
       setSelectedFile(null);
+      setSelectedNativeVideo(null);
       setPreviewUrl('');
       setDetectedDuration(0);
       setTitle('');
@@ -131,6 +138,33 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
   const cssFilter = useMemo(() => buildCssFilter(effect), [effect]);
 
   if (!isOpen) return null;
+
+  const handleOpenPicker = async () => {
+    if (isNativeAndroid()) {
+      const picked = await pickNativeVideos(false);
+      if (picked && !picked.cancelled && picked.videos.length > 0) {
+        const nativeVid = picked.videos[0];
+        if (previewUrl.startsWith('blob:')) {
+          URL.revokeObjectURL(previewUrl);
+        }
+        setSelectedFile(null);
+        setSelectedNativeVideo(nativeVid);
+        setPreviewUrl(nativeVid.url);
+        if (nativeVid.duration > 0) {
+          setDetectedDuration(nativeVid.duration);
+        }
+        setTitle(
+          (prev) => prev.trim() || cleanFileTitle(nativeVid.name) || 'Video Baru',
+        );
+        setErrorMsg('');
+        return;
+      }
+      if (picked) {
+        return;
+      }
+    }
+    fileInputRef.current?.click();
+  };
 
   const handlePickedFile = async (file: File) => {
     if (!isSupportedVideoFile(file)) {
@@ -162,6 +196,7 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
         url = URL.createObjectURL(file);
       }
     }
+    setSelectedNativeVideo(null);
     setSelectedFile(file);
     setPreviewUrl(url);
     setTitle((prev) => prev.trim() || cleanFileTitle(file.name) || 'Video Baru');
@@ -170,15 +205,18 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
 
   const handleSave = async () => {
     if (mode === 'create') {
-      if (!selectedFile) {
+      if (!selectedFile && !selectedNativeVideo) {
         setErrorMsg('Pilih berkas video terlebih dahulu sebelum menyimpan.');
         return;
       }
       setIsSaving(true);
       try {
+        const fallbackName =
+          selectedNativeVideo?.name || selectedFile?.name || 'Video Baru';
         await onCreateVideo({
-          file: selectedFile,
-          title: title.trim() || cleanFileTitle(selectedFile.name) || 'Video Baru',
+          file: selectedFile ?? undefined,
+          nativeVideo: selectedNativeVideo ?? undefined,
+          title: title.trim() || cleanFileTitle(fallbackName) || 'Video Baru',
           description: description.trim(),
           effect,
           duration: detectedDuration,
@@ -304,7 +342,7 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
               ) : (
                 <button
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={() => void handleOpenPicker()}
                   className="flex h-full w-full flex-col items-center justify-center gap-3 px-6 text-center text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200"
                 >
                   <span className="flex h-14 w-14 items-center justify-center rounded-full bg-white/10 text-white">
@@ -337,15 +375,22 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
                 />
                 <button
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={() => void handleOpenPicker()}
                   className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-4 text-xs font-semibold text-white transition hover:bg-white/10"
                 >
                   <Film className="h-4 w-4" />
-                  <span>{selectedFile ? 'Ganti Video' : 'Pilih Berkas Video'}</span>
+                  <span>
+                    {selectedFile || selectedNativeVideo
+                      ? 'Ganti Video'
+                      : 'Pilih Berkas Video'}
+                  </span>
                 </button>
-                {selectedFile && (
+                {(selectedFile || selectedNativeVideo) && (
                   <p className="max-w-[260px] truncate text-xs text-zinc-400">
-                    {selectedFile.name} · {formatFileSize(selectedFile.size)}
+                    {selectedNativeVideo?.name || selectedFile?.name} ·{' '}
+                    {formatFileSize(
+                      selectedNativeVideo?.size || selectedFile?.size || 0,
+                    )}
                   </p>
                 )}
               </div>
@@ -357,7 +402,11 @@ export const EffectStudioModal: React.FC<EffectStudioModalProps> = ({
                 onClick={() =>
                   void openNativeAndroidPlayer({
                     url: previewUrl,
-                    title: title || selectedFile?.name || 'Pratinjau Video',
+                    title:
+                      title ||
+                      selectedNativeVideo?.name ||
+                      selectedFile?.name ||
+                      'Pratinjau Video',
                     muted: false,
                   })
                 }

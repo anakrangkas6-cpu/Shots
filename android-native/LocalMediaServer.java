@@ -1,9 +1,13 @@
 package com.kilas.offlineshorts;
 
+import android.content.ContentResolver;
 import android.content.Context;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.provider.OpenableColumns;
+import com.getcapacitor.JSObject;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -24,17 +28,17 @@ import java.util.concurrent.Executors;
 
 public class LocalMediaServer {
 
-    private final File cacheDir;
+    private final File mediaDir;
     private final ServerSocket serverSocket;
     private final int port;
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private volatile boolean running = true;
 
     public LocalMediaServer(Context context) throws IOException {
-        this.cacheDir = new File(context.getCacheDir(), "kilas_media");
-        if (!this.cacheDir.exists()) {
+        this.mediaDir = new File(context.getFilesDir(), "kilas_media");
+        if (!this.mediaDir.exists()) {
             //noinspection ResultOfMethodCallIgnored
-            this.cacheDir.mkdirs();
+            this.mediaDir.mkdirs();
         }
         this.serverSocket = new ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"));
         this.port = this.serverSocket.getLocalPort();
@@ -53,15 +57,15 @@ public class LocalMediaServer {
     }
 
     public File getMediaFile(String id) {
-        return new File(cacheDir, sanitizeId(id) + ".bin");
+        return new File(mediaDir, sanitizeId(id) + ".bin");
     }
 
     private File getMimeFile(String id) {
-        return new File(cacheDir, sanitizeId(id) + ".mime");
+        return new File(mediaDir, sanitizeId(id) + ".mime");
     }
 
     private File getThumbFile(String id) {
-        return new File(cacheDir, sanitizeId(id) + ".thumb.jpg");
+        return new File(mediaDir, sanitizeId(id) + ".thumb.jpg");
     }
 
     public static String sanitizeId(String raw) {
@@ -73,6 +77,127 @@ public class LocalMediaServer {
             clean = clean.substring(0, 64) + "_" + Integer.toHexString(raw.hashCode());
         }
         return clean;
+    }
+
+    public boolean deleteMediaFiles(String id) {
+        String safeId = sanitizeId(id);
+        boolean ok = true;
+        File m = getMediaFile(safeId);
+        File mime = getMimeFile(safeId);
+        File thumb = getThumbFile(safeId);
+        if (m.exists()) ok = m.delete() && ok;
+        if (mime.exists()) ok = mime.delete() && ok;
+        if (thumb.exists()) ok = thumb.delete() && ok;
+        return ok;
+    }
+
+    public JSObject ingestContentUri(Context context, Uri uri, String displayNameHint, String mimeHint) throws IOException {
+        ContentResolver resolver = context.getContentResolver();
+        String fileName = displayNameHint;
+        long reportedSize = -1;
+
+        try (Cursor cursor = resolver.query(
+            uri,
+            new String[] { OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE },
+            null,
+            null,
+            null
+        )) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (nameIdx >= 0 && !cursor.isNull(nameIdx)) {
+                    String val = cursor.getString(nameIdx);
+                    if (val != null && !val.trim().isEmpty()) {
+                        fileName = val.trim();
+                    }
+                }
+                int sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE);
+                if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                    reportedSize = cursor.getLong(sizeIdx);
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        if (fileName == null || fileName.isEmpty()) {
+            String lastSeg = uri.getLastPathSegment();
+            fileName = (lastSeg != null && !lastSeg.isEmpty()) ? lastSeg : ("Video_" + System.currentTimeMillis());
+        }
+
+        String mimeType = mimeHint;
+        if (mimeType == null || mimeType.isEmpty() || !mimeType.startsWith("video/")) {
+            String resolvedType = resolver.getType(uri);
+            if (resolvedType != null && resolvedType.startsWith("video/")) {
+                mimeType = resolvedType;
+            } else {
+                mimeType = inferMimeFromName(fileName);
+            }
+        }
+
+        String rawKey = "native_" + fileName + "_" + (reportedSize > 0 ? reportedSize : Math.abs(uri.toString().hashCode()));
+        String safeId = sanitizeId(rawKey);
+        File mediaFile = getMediaFile(safeId);
+        File tempFile = new File(mediaDir, safeId + ".tmp");
+        File mimeFile = getMimeFile(safeId);
+        File thumbFile = getThumbFile(safeId);
+
+        long copiedBytes = 0;
+        if (!mediaFile.exists() || mediaFile.length() == 0) {
+            try (InputStream in = resolver.openInputStream(uri)) {
+                if (in == null) {
+                    throw new IOException("Cannot open InputStream for URI: " + uri);
+                }
+                try (FileOutputStream fos = new FileOutputStream(tempFile)) {
+                    byte[] buf = new byte[65536];
+                    int read;
+                    while ((read = in.read(buf)) != -1) {
+                        fos.write(buf, 0, read);
+                        copiedBytes += read;
+                    }
+                    fos.flush();
+                }
+            }
+            if (copiedBytes == 0) {
+                if (tempFile.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tempFile.delete();
+                }
+                throw new IOException("Empty video stream from URI: " + uri);
+            }
+            if (mediaFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                mediaFile.delete();
+            }
+            if (!tempFile.renameTo(mediaFile)) {
+                throw new IOException("Failed to move ingested video into storage");
+            }
+        } else {
+            copiedBytes = mediaFile.length();
+        }
+
+        try (FileOutputStream mfos = new FileOutputStream(mimeFile)) {
+            mfos.write(mimeType.getBytes(StandardCharsets.UTF_8));
+        }
+
+        double durationSec = probeAndGenerateThumbnail(mediaFile, thumbFile);
+
+        JSObject obj = new JSObject();
+        obj.put("id", safeId);
+        obj.put("name", fileName);
+        obj.put("size", copiedBytes > 0 ? copiedBytes : mediaFile.length());
+        obj.put("mimeType", mimeType);
+        obj.put("duration", durationSec);
+        obj.put("url", getBaseUrl() + "/media/" + safeId);
+        obj.put("thumbUrl", thumbFile.exists() ? (getBaseUrl() + "/thumb/" + safeId + ".jpg") : "");
+        return obj;
+    }
+
+    private String inferMimeFromName(String fileName) {
+        String lower = fileName.toLowerCase(Locale.US);
+        if (lower.endsWith(".webm")) return "video/webm";
+        if (lower.endsWith(".mov")) return "video/quicktime";
+        if (lower.endsWith(".mkv")) return "video/x-matroska";
+        if (lower.endsWith(".ogg") || lower.endsWith(".ogv")) return "video/ogg";
+        return "video/mp4";
     }
 
     public void shutdown() {
@@ -198,7 +323,7 @@ public class LocalMediaServer {
         }
         String safeId = sanitizeId(idParam);
         File mediaFile = getMediaFile(safeId);
-        File tempFile = new File(cacheDir, safeId + ".tmp");
+        File tempFile = new File(mediaDir, safeId + ".tmp");
         File mimeFile = getMimeFile(safeId);
         File thumbFile = getThumbFile(safeId);
 
@@ -315,22 +440,24 @@ public class LocalMediaServer {
             if (durStr != null) {
                 durationSec = Math.max(0, Long.parseLong(durStr) / 1000.0);
             }
-            Bitmap bmp = retriever.getFrameAtTime(500_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
-            if (bmp == null) {
-                bmp = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
-            }
-            if (bmp == null) {
-                bmp = retriever.getFrameAtTime();
-            }
-            if (bmp != null) {
-                Bitmap scaled = scaleBitmap(bmp, 540);
-                try (FileOutputStream fos = new FileOutputStream(thumbFile)) {
-                    scaled.compress(Bitmap.CompressFormat.JPEG, 82, fos);
+            if (!thumbFile.exists() || thumbFile.length() == 0) {
+                Bitmap bmp = retriever.getFrameAtTime(500_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+                if (bmp == null) {
+                    bmp = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
                 }
-                if (scaled != bmp) {
-                    scaled.recycle();
+                if (bmp == null) {
+                    bmp = retriever.getFrameAtTime();
                 }
-                bmp.recycle();
+                if (bmp != null) {
+                    Bitmap scaled = scaleBitmap(bmp, 540);
+                    try (FileOutputStream fos = new FileOutputStream(thumbFile)) {
+                        scaled.compress(Bitmap.CompressFormat.JPEG, 82, fos);
+                    }
+                    if (scaled != bmp) {
+                        scaled.recycle();
+                    }
+                    bmp.recycle();
+                }
             }
         } catch (Throwable ignored) {
             // Non-fatal if metadata or frame extraction is unavailable for a specific stream

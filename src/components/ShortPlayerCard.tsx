@@ -343,12 +343,22 @@ export const ShortPlayerCard: React.FC<ShortPlayerCardProps> = ({
         setResolvedUrl(nativeRes.url);
       }
     }
-    if (targetUrl) {
+    if (!targetUrl || targetUrl.startsWith('blob:')) {
+      setVideoError(
+        'Berkas ini belum tersalin ke penyimpanan internal aplikasi. Hapus dan pilih ulang lewat tombol Tambah (+) atau Pilih File Video.',
+      );
+      return;
+    }
+    try {
       await openNativeAndroidPlayer({
         url: targetUrl,
         title: video.title,
         muted: isMuted,
       });
+    } catch {
+      setVideoError(
+        'Pemutar Android tidak dapat membuka berkas ini. Pilih ulang berkas lewat menu Folder atau Tambah (+).',
+      );
     }
   }, [
     video.id,

@@ -18,12 +18,15 @@ const STORE_SETTINGS = 'settings';
 
 export interface PersistedUploadedVideo {
   id: string;
+  sourceType?: 'uploaded' | 'folder';
+  relativePath?: string;
   title: string;
   description: string;
   fileName: string;
   fileSize: number;
   duration: number;
-  blob: Blob;
+  blob?: Blob;
+  nativeMediaId?: string;
   createdAt: number;
   effect: VideoEffectConfig;
 }

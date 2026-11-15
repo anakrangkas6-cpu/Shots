@@ -21,7 +21,16 @@ import {
   scanDroppedItems,
   scanFileList,
 } from './services/folderScanner';
-import { cacheBlobToNativeServer, isNativeAndroid } from './services/nativeMedia';
+import {
+  buildNativeMediaUrls,
+  cacheBlobToNativeServer,
+  deleteNativeMedia,
+  getNativeMediaServerUrl,
+  isNativeAndroid,
+  NativePickedVideo,
+  pickNativeFolder,
+  pickNativeVideos,
+} from './services/nativeMedia';
 import {
   buildInitialSamples,
   deleteUploadedVideo,
@@ -108,6 +117,7 @@ export function App() {
       if (cancelled) return;
 
       const nativeAndroid = isNativeAndroid();
+      const nativeBaseUrl = nativeAndroid ? await getNativeMediaServerUrl() : null;
       const sortedUploads = [...uploadedList].sort(
         (a, b) => b.createdAt - a.createdAt,
       );
@@ -118,7 +128,11 @@ export function App() {
           let posterUrl: string | undefined;
           let detectedDur = 0;
 
-          if (nativeAndroid) {
+          if (nativeAndroid && item.nativeMediaId && nativeBaseUrl) {
+            const urls = buildNativeMediaUrls(nativeBaseUrl, item.nativeMediaId);
+            url = urls.url;
+            posterUrl = urls.thumbUrl;
+          } else if (nativeAndroid && item.blob) {
             const nativeRes = await cacheBlobToNativeServer(
               item.id,
               item.blob,
@@ -131,7 +145,7 @@ export function App() {
             }
           }
 
-          if (!url) {
+          if (!url && item.blob) {
             url = URL.createObjectURL(item.blob);
             objectUrlsRef.current.push(url);
           }
@@ -139,15 +153,16 @@ export function App() {
           const saved = metaMap[item.id];
           return {
             id: item.id,
-            sourceType: 'uploaded' as const,
+            sourceType: (item.sourceType || 'uploaded') as 'uploaded' | 'folder',
             title: saved?.title || item.title,
             description: saved?.description ?? item.description,
             fileName: item.fileName,
-            relativePath: 'Studio Lokal',
+            relativePath: item.relativePath || 'Studio Lokal',
             fileSize: item.fileSize,
             duration: saved?.duration || item.duration || detectedDur,
             videoUrl: url,
             posterUrl,
+            nativeMediaId: item.nativeMediaId,
             sourceBlob: item.blob,
             createdAt: item.createdAt,
             likesCount: saved?.likesCount ?? 0,
@@ -220,8 +235,27 @@ export function App() {
       );
 
       for (const item of folderShorts) {
-        if (item.videoUrl) {
+        if (item.videoUrl && item.videoUrl.startsWith('blob:')) {
           objectUrlsRef.current.push(item.videoUrl);
+        }
+      }
+
+      // Also persist reasonably-sized local picks into IndexedDB on Web/PWA so they survive reloads
+      for (const item of folderShorts) {
+        if (item.sourceBlob && item.sourceBlob.size <= 100 * 1024 * 1024) {
+          void saveUploadedVideo({
+            id: item.id,
+            sourceType: 'folder',
+            relativePath: item.relativePath,
+            title: item.title,
+            description: item.description,
+            fileName: item.fileName,
+            fileSize: item.fileSize,
+            duration: item.duration,
+            blob: item.sourceBlob,
+            createdAt: item.createdAt,
+            effect: item.effect,
+          });
         }
       }
 
@@ -235,27 +269,158 @@ export function App() {
       await saveFolderStatus(nextStatus);
 
       setVideos((prev) => {
-        // Revoke previous folder video object URLs to keep memory tidy
-        for (const old of prev) {
-          if (old.sourceType === 'folder' && old.videoUrl) {
-            URL.revokeObjectURL(old.videoUrl);
-          }
-        }
-        const uploaded = prev.filter((v) => v.sourceType === 'uploaded');
-        return [...folderShorts, ...uploaded];
+        const incomingIds = new Set(folderShorts.map((v) => v.id));
+        const kept = prev.filter((v) => !incomingIds.has(v.id));
+        return [...folderShorts, ...kept];
       });
 
       setActiveIndex(0);
       setActiveSection('feed');
       feedContainerRef.current?.scrollTo({ top: 0, behavior: 'auto' });
       showNotice(
-        `${folderShorts.length} video dimuat dari folder "${folderName}".`,
+        `${folderShorts.length} video ditambahkan dari "${folderName}". Video lama tetap tersimpan.`,
       );
     },
     [profile, showNotice],
   );
 
+  const applyNativePickedVideos = useCallback(
+    async (
+      nativeVideos: NativePickedVideo[],
+      folderName: string,
+    ) => {
+      if (nativeVideos.length === 0) {
+        showNotice(`Tidak ditemukan berkas video di "${folderName}".`);
+        return;
+      }
+
+      const metaMap: Record<string, StoredVideoMeta> = await loadAllVideoMeta();
+      const now = Date.now();
+
+      const addedItems: ShortVideoItem[] = await Promise.all(
+        nativeVideos.map(async (nv, idx) => {
+          const id = `native:${nv.id}`;
+          const saved = metaMap[id];
+          const title =
+            saved?.title || cleanFileTitle(nv.name) || 'Video Pribadi';
+          const description =
+            saved?.description || `Sumber lokal dari ${folderName} (${nv.name})`;
+          const effect = saved?.effect
+            ? { ...DEFAULT_EFFECT_CONFIG, ...saved.effect }
+            : { ...DEFAULT_EFFECT_CONFIG };
+
+          const shortItem: ShortVideoItem = {
+            id,
+            sourceType: 'folder',
+            title,
+            description,
+            fileName: nv.name,
+            relativePath: folderName,
+            fileSize: nv.size,
+            duration: saved?.duration || nv.duration || 0,
+            videoUrl: nv.url,
+            posterUrl: nv.thumbUrl || undefined,
+            nativeMediaId: nv.id,
+            createdAt: now - idx,
+            likesCount: saved?.likesCount ?? 0,
+            likedByMe: saved?.likedByMe ?? false,
+            bookmarkedByMe: saved?.bookmarkedByMe ?? false,
+            comments: saved?.comments ?? [],
+            effect,
+            creatorName: profile.name,
+            creatorHandle: profile.handle,
+            creatorAvatar: profile.avatarDataUrl,
+            isOwnVideo: true,
+          };
+
+          await saveUploadedVideo({
+            id,
+            sourceType: 'folder',
+            relativePath: folderName,
+            title,
+            description,
+            fileName: nv.name,
+            fileSize: nv.size,
+            duration: shortItem.duration,
+            nativeMediaId: nv.id,
+            createdAt: shortItem.createdAt,
+            effect,
+          });
+
+          return shortItem;
+        }),
+      );
+
+      const nextStatus: FolderSyncStatus = {
+        folderName,
+        lastSyncedAt: Date.now(),
+        videoCount: addedItems.length,
+        hasDirectoryHandle: false,
+      };
+      setFolderStatus(nextStatus);
+      await saveFolderStatus(nextStatus);
+
+      setVideos((prev) => {
+        const incomingIds = new Set(addedItems.map((v) => v.id));
+        const kept = prev.filter((v) => !incomingIds.has(v.id));
+        return [...addedItems, ...kept];
+      });
+
+      setActiveIndex(0);
+      setActiveSection('feed');
+      feedContainerRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+      showNotice(
+        `${addedItems.length} video ditambahkan dari "${folderName}". Video lama tetap aman.`,
+      );
+    },
+    [profile, showNotice],
+  );
+
+  const handlePickFiles = useCallback(async () => {
+    if (isNativeAndroid()) {
+      setIsScanning(true);
+      try {
+        const picked = await pickNativeVideos(true);
+        if (picked && !picked.cancelled) {
+          await applyNativePickedVideos(picked.videos, 'Galeri & Berkas');
+          return;
+        }
+        if (picked?.cancelled) {
+          return;
+        }
+      } finally {
+        setIsScanning(false);
+      }
+    }
+    fallbackFolderInputRef.current?.click();
+  }, [applyNativePickedVideos]);
+
   const handlePickFolder = useCallback(async () => {
+    if (isNativeAndroid()) {
+      setIsScanning(true);
+      try {
+        const treeRes = await pickNativeFolder();
+        if (treeRes && !treeRes.cancelled) {
+          await applyNativePickedVideos(treeRes.videos, treeRes.folderName);
+          return;
+        }
+        if (treeRes?.cancelled) {
+          return;
+        }
+        // If device lacks document tree UI, fall back cleanly to multi-file native picker
+        const picked = await pickNativeVideos(true);
+        if (picked && !picked.cancelled) {
+          await applyNativePickedVideos(picked.videos, 'Folder Pribadi');
+          return;
+        }
+        if (picked?.cancelled) {
+          return;
+        }
+      } finally {
+        setIsScanning(false);
+      }
+    }
+
     const pickerFn = (
       window as Window & {
         showDirectoryPicker?: (opts?: {
@@ -285,7 +450,7 @@ export function App() {
     }
 
     fallbackFolderInputRef.current?.click();
-  }, [applyScannedEntries]);
+  }, [applyScannedEntries, applyNativePickedVideos]);
 
   const handleFallbackFolderSelected = useCallback(
     async (fileList: FileList) => {
@@ -621,12 +786,70 @@ export function App() {
   // Create new video with effects handler
   const handleCreateVideo = useCallback(
     async (payload: {
-      file: File;
+      file?: File;
+      nativeVideo?: NativePickedVideo;
       title: string;
       description: string;
       effect: VideoEffectConfig;
       duration: number;
     }) => {
+      if (payload.nativeVideo) {
+        const nv = payload.nativeVideo;
+        const id = `uploaded:native:${nv.id}`;
+        const persisted: PersistedUploadedVideo = {
+          id,
+          sourceType: 'uploaded',
+          relativePath: 'Studio Lokal',
+          title: payload.title,
+          description: payload.description,
+          fileName: nv.name,
+          fileSize: nv.size,
+          duration: payload.duration || nv.duration || 0,
+          nativeMediaId: nv.id,
+          createdAt: Date.now(),
+          effect: payload.effect,
+        };
+        await saveUploadedVideo(persisted);
+
+        const newShort: ShortVideoItem = {
+          id,
+          sourceType: 'uploaded',
+          title: payload.title || cleanFileTitle(nv.name),
+          description: payload.description,
+          fileName: nv.name,
+          relativePath: 'Studio Lokal',
+          fileSize: nv.size,
+          duration: persisted.duration,
+          videoUrl: nv.url,
+          posterUrl: nv.thumbUrl || undefined,
+          nativeMediaId: nv.id,
+          createdAt: persisted.createdAt,
+          likesCount: 0,
+          likedByMe: false,
+          bookmarkedByMe: false,
+          comments: [],
+          effect: payload.effect,
+          creatorName: profile.name,
+          creatorHandle: profile.handle,
+          creatorAvatar: profile.avatarDataUrl,
+          isOwnVideo: true,
+        };
+
+        await saveVideoMeta(extractMetaFromShort(newShort));
+        setVideos((prev) => [newShort, ...prev.filter((v) => v.id !== id)]);
+        setActiveSection('feed');
+        setActiveIndex(0);
+        window.setTimeout(() => {
+          feedContainerRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+        }, 60);
+        showNotice('Video baru dan efeknya berhasil ditambahkan.');
+        return;
+      }
+
+      if (!payload.file) {
+        throw new Error('Tidak ada berkas video.');
+      }
+
       const id = `uploaded:${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       const mime = inferVideoMimeType(payload.file);
       let concreteBlob: Blob = payload.file;
@@ -639,6 +862,8 @@ export function App() {
 
       const persisted: PersistedUploadedVideo = {
         id,
+        sourceType: 'uploaded',
+        relativePath: 'Studio Lokal',
         title: payload.title,
         description: payload.description,
         fileName: payload.file.name,
@@ -724,17 +949,20 @@ export function App() {
 
   const handleDeleteUploadedVideo = useCallback(
     async (videoId: string) => {
+      const target = videos.find((v) => v.id === videoId);
       await deleteUploadedVideo(videoId);
+      if (target?.nativeMediaId) {
+        await deleteNativeMedia(target.nativeMediaId);
+      }
       setVideos((prev) => {
-        const target = prev.find((v) => v.id === videoId);
-        if (target?.videoUrl) {
+        if (target?.videoUrl && target.videoUrl.startsWith('blob:')) {
           URL.revokeObjectURL(target.videoUrl);
         }
         return prev.filter((v) => v.id !== videoId);
       });
-      showNotice('Video studio dihapus.');
+      showNotice('Video dihapus.');
     },
-    [showNotice],
+    [videos, showNotice],
   );
 
   const handleSelectVideoFromLibrary = useCallback(
@@ -913,6 +1141,7 @@ export function App() {
             activeFilter={libraryFilter}
             onFilterChange={setLibraryFilter}
             onPickFolder={handlePickFolder}
+            onPickFiles={handlePickFiles}
             onFallbackFolderSelected={handleFallbackFolderSelected}
             onDropDataTransfer={handleDropDataTransfer}
             onResyncSavedFolder={handleResyncSavedFolder}

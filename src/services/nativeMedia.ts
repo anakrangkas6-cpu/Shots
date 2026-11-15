@@ -1,7 +1,26 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
 
+export interface NativePickedVideo {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  duration: number;
+  url: string;
+  thumbUrl: string;
+}
+
 interface KilasMediaPluginContract {
   getServerInfo(): Promise<{ baseUrl: string; port: number }>;
+  pickVideos(options?: {
+    multiple?: boolean;
+  }): Promise<{ cancelled?: boolean; videos: NativePickedVideo[] }>;
+  pickFolderVideos(): Promise<{
+    cancelled?: boolean;
+    folderName?: string;
+    videos: NativePickedVideo[];
+  }>;
+  deleteMedia(options: { id: string }): Promise<void>;
   openNativePlayer(options: {
     url: string;
     title?: string;
@@ -14,6 +33,7 @@ const KilasMedia = registerPlugin<KilasMediaPluginContract>('KilasMedia');
 let cachedBaseUrlPromise: Promise<string | null> | null = null;
 
 export interface CachedNativeMediaResult {
+  id?: string;
   url: string;
   thumbUrl?: string;
   duration?: number;
@@ -37,6 +57,16 @@ export async function getNativeMediaServerUrl(): Promise<string | null> {
       .catch(() => null);
   }
   return cachedBaseUrlPromise;
+}
+
+export function buildNativeMediaUrls(
+  baseUrl: string,
+  nativeMediaId: string,
+): { url: string; thumbUrl: string } {
+  return {
+    url: `${baseUrl}/media/${encodeURIComponent(nativeMediaId)}`,
+    thumbUrl: `${baseUrl}/thumb/${encodeURIComponent(nativeMediaId)}.jpg`,
+  };
 }
 
 function makeStableKey(id: string): string {
@@ -71,12 +101,14 @@ export async function cacheBlobToNativeServer(
     if (!response.ok) return null;
     const data = (await response.json()) as {
       ok?: boolean;
+      id?: string;
       url?: string;
       thumbUrl?: string;
       duration?: number;
     };
     if (!data?.ok || !data.url) return null;
     return {
+      id: data.id || key,
       url: data.url,
       thumbUrl: data.thumbUrl || undefined,
       duration:
@@ -101,16 +133,54 @@ export async function cacheBlobToNativeServer(
   }
 }
 
+export async function pickNativeVideos(
+  multiple = true,
+): Promise<{ cancelled: boolean; videos: NativePickedVideo[] } | null> {
+  if (!isNativeAndroid()) return null;
+  try {
+    const res = await KilasMedia.pickVideos({ multiple });
+    return {
+      cancelled: Boolean(res?.cancelled),
+      videos: Array.isArray(res?.videos) ? res.videos : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function pickNativeFolder(): Promise<{
+  cancelled: boolean;
+  folderName: string;
+  videos: NativePickedVideo[];
+} | null> {
+  if (!isNativeAndroid()) return null;
+  try {
+    const res = await KilasMedia.pickFolderVideos();
+    return {
+      cancelled: Boolean(res?.cancelled),
+      folderName: res?.folderName || 'Folder Pribadi',
+      videos: Array.isArray(res?.videos) ? res.videos : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteNativeMedia(nativeMediaId: string): Promise<void> {
+  if (!isNativeAndroid() || !nativeMediaId) return;
+  try {
+    await KilasMedia.deleteMedia({ id: nativeMediaId });
+  } catch {
+    // ignore cleanup error
+  }
+}
+
 export async function openNativeAndroidPlayer(options: {
   url: string;
   title?: string;
   muted?: boolean;
 }): Promise<boolean> {
   if (!isNativeAndroid()) return false;
-  try {
-    await KilasMedia.openNativePlayer(options);
-    return true;
-  } catch {
-    return false;
-  }
+  await KilasMedia.openNativePlayer(options);
+  return true;
 }

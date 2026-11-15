@@ -23,6 +23,7 @@ import {
   getPresetLabel,
   TRANSPARENT_POSTER,
 } from '../utils/effects';
+import { isNativeAndroid } from '../services/nativeMedia';
 import { PWAInstallButton } from './PWAInstallButton';
 
 export type LibraryFilter = 'all' | 'folder' | 'uploaded' | 'liked' | 'saved';
@@ -36,6 +37,7 @@ interface FolderLibraryViewProps {
   activeFilter: LibraryFilter;
   onFilterChange: (filter: LibraryFilter) => void;
   onPickFolder: () => void;
+  onPickFiles: () => void;
   onFallbackFolderSelected: (files: FileList) => void;
   onDropDataTransfer: (dataTransfer: DataTransfer) => void;
   onResyncSavedFolder: () => void;
@@ -54,6 +56,7 @@ export const FolderLibraryView: React.FC<FolderLibraryViewProps> = ({
   activeFilter,
   onFilterChange,
   onPickFolder,
+  onPickFiles,
   onFallbackFolderSelected,
   onDropDataTransfer,
   onResyncSavedFolder,
@@ -226,7 +229,13 @@ export const FolderLibraryView: React.FC<FolderLibraryViewProps> = ({
             />
             <button
               type="button"
-              onClick={() => folderInputRef.current?.click()}
+              onClick={() => {
+                if (isNativeAndroid()) {
+                  onPickFolder();
+                } else {
+                  folderInputRef.current?.click();
+                }
+              }}
               className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/15 bg-zinc-900 px-3.5 text-xs font-medium text-zinc-200 transition hover:bg-zinc-800"
             >
               <span>Telusuri Direktori</span>
@@ -247,7 +256,13 @@ export const FolderLibraryView: React.FC<FolderLibraryViewProps> = ({
             />
             <button
               type="button"
-              onClick={() => multiFileInputRef.current?.click()}
+              onClick={() => {
+                if (isNativeAndroid()) {
+                  onPickFiles();
+                } else {
+                  multiFileInputRef.current?.click();
+                }
+              }}
               className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/15 bg-zinc-900 px-3.5 text-xs font-medium text-zinc-200 transition hover:bg-zinc-800"
             >
               <span>Pilih File Video</span>
@@ -384,7 +399,7 @@ export const FolderLibraryView: React.FC<FolderLibraryViewProps> = ({
                   </div>
                 </button>
 
-                {item.sourceType === 'uploaded' && (
+                {item.sourceType !== 'sample' && (
                   <div className="flex items-center justify-between border-t border-white/10 px-2.5 py-2 text-[11px] text-zinc-400">
                     <span className="truncate">{formatFileSize(item.fileSize)}</span>
                     <button
