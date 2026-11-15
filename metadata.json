@@ -1,0 +1,6 @@
+{
+  "name": "Kilas — Shorts Offline Pribadi",
+  "description": "Pemutar video pendek vertikal offline dari folder penyimpanan pribadi lengkap dengan efek video, pengeditan profil, like, dan komentar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
